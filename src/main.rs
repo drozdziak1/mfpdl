@@ -1,21 +1,21 @@
-extern crate reqwest;
-
-extern crate futures;
-extern crate scraper;
-
-use futures::future;
+use failure::format_err;
+use futures::prelude::*;
+use indicatif::{MultiProgress, ProgressBar};
+use reqwest::Response;
 use scraper::{Html, Selector};
-use tokio::process::Command;
+use tokio::{ task};
 
 use std::iter::Iterator;
 
-const URL: &'static str = "https://www.musicforprogramming.net";
+const MFP_URL: &'static str = "https://www.musicforprogramming.net";
+
+type ErrBox = Box<dyn std::error::Error>;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let resp = reqwest::get(URL).await?;
+async fn main() -> Result<(), ErrBox> {
+    let resp = reqwest::get(MFP_URL).await?;
     if !resp.status().is_success() {
-        panic!("Request failed for {}", URL);
+        panic!("Request failed for {}", MFP_URL);
     }
 
     let body = resp.text().await?;
@@ -33,14 +33,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .attr("href")
         .expect(&format!("Failed to get href for latest"));
 
-    let fname = latest_url.split("/").last().unwrap();
-    println!("Downloading {}... ", fname);
+    let latest_fname = latest_url.split("/").last().unwrap();
+    let latest_resp = reqwest::get(latest_url).await?;
+    let latest_len = latest_resp
+        .content_length()
+        .ok_or_else(|| format_err!("Could not get Content-Length on latest episode"))?;
+    let latest_pb = ProgressBar::new(latest_len);
 
-    Command::new("wget").args(&["-N", &latest_url]).output().await?;
-    println!("{} OK", fname);
+    // Setup the MultiProgress bar
+    let mpb = MultiProgress::new();
+    mpb.add(latest_pb.clone());
 
+    let latest_fut = latest_resp
+        .bytes_stream()
+        .err_into::<ErrBox>()
+        .try_for_each(|bytes| {
+            let pb4fut = latest_pb.clone();
+            async move {
+                pb4fut.inc(bytes.len() as u64);
+                Ok(())
+            }
+        });
+
+    // Scrape links and prepare progress bars
     let ep_selec = Selector::parse("#episodes a").expect("Couldn't parse the episode selector");
-    let futs = fragment
+
+    let scrape_futs = fragment
         .select(&ep_selec)
         .enumerate()
         .map(|(idx, episode)| async move {
@@ -48,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Couldn't parse the file link selector");
 
             let subpage = episode.value().attr("href").unwrap();
-            let ep_url = &format!("{}/{}", URL, subpage);
+            let ep_url = &format!("{}/{}", MFP_URL, subpage);
             let subpage_resp = reqwest::get(ep_url).await?;
 
             let body = subpage_resp.text().await?;
@@ -64,14 +82,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect(&format!("Failed to get href for {}", idx + 1));
 
             let fname = file_url.split("/").last().unwrap();
-            println!("Downloading {}... ", fname);
+            println!("Scraping {}... ", fname);
 
-            Command::new("wget").args(&["-N", &file_url]).output().await?;
-            println!("{} OK", fname);
+            let file_resp = reqwest::get(file_url).await?;
 
-            Result::<(), Box<dyn std::error::Error>>::Ok(())
+            let file_len = file_resp
+                .content_length()
+                .ok_or_else(|| format_err!("Could not get Content-Length for {}", fname))?;
+
+            let pb = ProgressBar::new(file_len);
+
+            Result::<(Response, String, ProgressBar), ErrBox>::Ok((file_resp, fname.to_owned(), pb))
         });
 
-    future::try_join_all(futs).await?;
+    let mut scraped = future::try_join_all(scrape_futs).await?;
+
+    println!("Foud {} episodes, downloading", scraped.len() + 1);
+
+    let dl_futs = scraped.drain(..).map(|(resp, fname, pb)| {
+        let resp4fut = resp;
+        mpb.add(pb.clone());
+        async move {
+            resp4fut
+                .bytes_stream()
+                .err_into::<ErrBox>()
+                .try_for_each(move |bytes| {
+                    let pb4fut = pb.clone();
+                    async move {
+                        pb4fut.inc(bytes.len() as u64);
+                        Ok(())
+                    }
+                })
+                .await?;
+            Result::<(), ErrBox>::Ok(())
+        }
+    });
+
+    let downloads_joined = future::try_join_all(dl_futs).err_into::<ErrBox>();
+
+    let bar_join_fut = async move {
+        task::spawn_blocking(move || mpb.join_and_clear())
+            .err_into::<ErrBox>()
+            .await??;
+        Ok(())
+    };
+
+    future::try_join3(downloads_joined, latest_fut, bar_join_fut).await?;
+
     Ok(())
 }

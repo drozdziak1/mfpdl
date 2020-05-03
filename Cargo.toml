@@ -5,7 +5,9 @@ version = "0.1.0"
 authors = ["Stan Drozd <drozdziak1@gmail.com>"]
 
 [dependencies]
-reqwest = "0.10.4"
+reqwest = {version = "0.10.4", features = ["stream"]}
 scraper = "0.11.0"
 futures = "0.3.4"
 tokio = {version = "0.2.20", features = ["macros", "rt-threaded", "process"]}
+failure = "0.1.7"
+indicatif = "0.14.0"
