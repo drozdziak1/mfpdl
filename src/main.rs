@@ -1,24 +1,25 @@
 use failure::format_err;
 use futures::{lock::Mutex, prelude::*};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use lazy_static::lazy_static;
 use reqwest::Response;
 use scraper::{Html, Selector};
-use tokio::{sync::Semaphore, task};
+use tokio::{fs::OpenOptions, prelude::*, sync::Semaphore, task};
 
-use std::{iter::Iterator, path::PathBuf, sync::Arc};
+use std::{io, iter::Iterator, path::PathBuf, sync::Arc};
 
 const MFP_URL: &'static str = "https://www.musicforprogramming.net";
-const MFP_FILE_SELECTOR: &'static str = "div .pad a[href$=mp3]";
-const MFP_EP_SELECTOR: &'static str = "#episodes a";
-const N_JOBS: usize = 2;
+const N_JOBS: usize = 8;
+
+// HTML element selectors for the scraper lib, reused across downloads
+lazy_static!{
+    static ref MFP_FILE_SELECTOR: Selector = Selector::parse("div .pad a[href$=mp3]")
+        .map_err(|e|format_err!("Could not parse the file selector: {:?}", e)).unwrap();
+    static ref MFP_EP_SELECTOR: Selector = Selector::parse("#episodes a")
+        .map_err(|e|format_err!("Could not parse the episode selector: {:?}", e)).unwrap();
+}
 
 type ErrBox = Box<dyn std::error::Error>;
-
-#[derive(Clone, Debug)]
-struct BarEntry {
-    pub is_free: bool,
-    pub pb: ProgressBar,
-}
 
 /// Downloads a `reqwest::Response` to the specified location while respecting a job count quota
 /// guarded by `sema`. `bars` must contain as many bar entries as there are permits in the
@@ -26,23 +27,16 @@ struct BarEntry {
 async fn download_with_sema(
     resp: Response,
     sema: Arc<Semaphore>,
-    bars: Arc<Mutex<Vec<BarEntry>>>,
+    bars: Arc<Vec<Mutex<ProgressBar>>>,
     fname: PathBuf,
 ) -> Result<(), ErrBox> {
     // Wait for a free progress bar
-    let permit = sema.acquire().await;
-    let (bar_idx, bar_entry) = {
-        let mut lock = bars.lock().await;
-        let idx = lock
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, b)| b.is_free)
-            .nth(0)
-            .unwrap() // Guaranteed Some() by the semaphore
-            .0;
-        lock[idx].is_free = false;
-        (idx, lock[idx].clone())
-    };
+    let _permit = sema.acquire().await;
+    let pb = bars
+        .iter()
+        .filter_map(|mutex| mutex.try_lock())
+        .nth(0)
+        .ok_or_else(|| format_err!("Could not acquire a lock for a progress bar despite permit"))?;
 
     // Find out when the progress bar should end
     let len = resp
@@ -50,9 +44,9 @@ async fn download_with_sema(
         .ok_or_else(|| format_err!("Could not get Content-Length for {:?}", fname))?;
 
     // Prepare the progress bar
-    bar_entry.pb.set_length(len as u64);
-    bar_entry.pb.set_position(0);
-    bar_entry.pb.set_message(
+    pb.set_length(len as u64);
+    pb.set_position(0);
+    pb.set_message(
         fname
             .file_name()
             .ok_or_else(|| format_err!("Could not get file name from path for {:?}", fname))?
@@ -60,33 +54,40 @@ async fn download_with_sema(
             .unwrap(),
     );
 
-    // Stream the response to a file
-    resp.bytes_stream()
-        .err_into::<ErrBox>()
-        .try_for_each(move |bytes| {
-            let pb4fut = bar_entry.pb.clone();
-            async move {
-                pb4fut.inc(bytes.len() as u64);
-                Ok(())
-            }
-        })
-        .await?;
+    let mut file = match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&fname)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            pb.println(format!("File {:?} already exists, skipping...", fname));
+            pb.set_message("Idle");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    // Free the bar after use
-    bars.lock().await[bar_idx].is_free = true;
-    drop(permit);
+    // Stream the response to a file
+    let mut stream = resp.bytes_stream().err_into::<ErrBox>();
+
+    while let Some(res) = stream.next().await {
+        let bytes = res?;
+        file.write_all(&bytes).await?;
+        pb.inc(bytes.len() as u64);
+    }
+
     Ok(())
 }
 
 /// Retrieve a file URL for the specified musicforprogramming.net episode URL
 async fn scrape_episode_file_url(url: &str) -> Result<String, ErrBox> {
-    let file_selec = Selector::parse(MFP_FILE_SELECTOR)
-        .map_err(|e| format_err!("Could not parse the file selector: {:?}", e))?;
     let resp = reqwest::get(url).await?;
     let fragment = Html::parse_document(&resp.text().await?);
 
     let file_url = fragment
-        .select(&file_selec)
+        .select(&*MFP_FILE_SELECTOR)
         .nth(0)
         .ok_or_else(|| format_err!("Could not find file URL for {}", url))?
         .value()
@@ -108,10 +109,10 @@ async fn main() -> Result<(), ErrBox> {
                 let pb = ProgressBar::new(0);
                 pb.set_style(ProgressStyle::default_bar().template("{msg} {bar} {pos}/{len}"));
                 mpb.add(pb.clone());
-                BarEntry { is_free: true, pb }
+                Mutex::new(pb)
             })
             .collect::<Vec<_>>();
-        Arc::new(Mutex::new(v))
+        Arc::new(v)
     };
 
     // Setup a semaphore for tracking available bars
@@ -140,9 +141,7 @@ async fn main() -> Result<(), ErrBox> {
     let body = resp.text().await?;
     let fragment = Html::parse_document(&body);
 
-    let ep_selec = Selector::parse(MFP_EP_SELECTOR).expect("Couldn't parse the episode selector");
-
-    let dl_futs = fragment.select(&ep_selec).map(|episode| {
+    let dl_futs = fragment.select(&*MFP_EP_SELECTOR).map(|episode| {
         let bars4fut = bars.clone();
         let sema4fut = sema.clone();
         async move {
@@ -169,7 +168,16 @@ async fn main() -> Result<(), ErrBox> {
         Result::<(), ErrBox>::Ok(())
     };
 
-    future::try_join3(downloads_joined, latest_fut, bar_join_fut).await?;
+    let cleanup_after_download_fut = async move {
+        future::try_join(latest_fut, downloads_joined).await?;
+        for mutex in bars.iter() {
+            mutex.lock().await.finish();
+        }
+
+        Result::<(), ErrBox>::Ok(())
+    };
+
+    future::try_join(cleanup_after_download_fut, bar_join_fut).await?;
 
     Ok(())
 }
