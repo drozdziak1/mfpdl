@@ -1,3 +1,4 @@
+use clap::{App, Arg, ArgMatches};
 use failure::format_err;
 use futures::{lock::Mutex, prelude::*};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -6,17 +7,19 @@ use reqwest::Response;
 use scraper::{Html, Selector};
 use tokio::{fs::OpenOptions, prelude::*, sync::Semaphore, task};
 
-use std::{io, iter::Iterator, path::PathBuf, sync::Arc};
+use std::{io, iter::Iterator, path::PathBuf, sync::Arc, fs};
 
 const MFP_URL: &'static str = "https://www.musicforprogramming.net";
-const N_JOBS: usize = 8;
+const DEFAULT_N_JOBS: &'static str = "8";
 
 // HTML element selectors for the scraper lib, reused across downloads
-lazy_static!{
+lazy_static! {
     static ref MFP_FILE_SELECTOR: Selector = Selector::parse("div .pad a[href$=mp3]")
-        .map_err(|e|format_err!("Could not parse the file selector: {:?}", e)).unwrap();
+        .map_err(|e| format_err!("Could not parse the file selector: {:?}", e))
+        .unwrap();
     static ref MFP_EP_SELECTOR: Selector = Selector::parse("#episodes a")
-        .map_err(|e|format_err!("Could not parse the episode selector: {:?}", e)).unwrap();
+        .map_err(|e| format_err!("Could not parse the episode selector: {:?}", e))
+        .unwrap();
 }
 
 type ErrBox = Box<dyn std::error::Error>;
@@ -28,7 +31,7 @@ async fn download_with_sema(
     resp: Response,
     sema: Arc<Semaphore>,
     bars: Arc<Vec<Mutex<ProgressBar>>>,
-    fname: PathBuf,
+    path: PathBuf,
 ) -> Result<(), ErrBox> {
     // Wait for a free progress bar
     let _permit = sema.acquire().await;
@@ -41,15 +44,14 @@ async fn download_with_sema(
     // Find out when the progress bar should end
     let len = resp
         .content_length()
-        .ok_or_else(|| format_err!("Could not get Content-Length for {:?}", fname))?;
+        .ok_or_else(|| format_err!("Could not get Content-Length for {:?}", path))?;
 
     // Prepare the progress bar
     pb.set_length(len as u64);
     pb.set_position(0);
     pb.set_message(
-        fname
-            .file_name()
-            .ok_or_else(|| format_err!("Could not get file name from path for {:?}", fname))?
+        path.file_name()
+            .ok_or_else(|| format_err!("Could not get file name from path for {:?}", path))?
             .to_str()
             .unwrap(),
     );
@@ -57,12 +59,12 @@ async fn download_with_sema(
     let mut file = match OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&fname)
+        .open(&path)
         .await
     {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            pb.println(format!("File {:?} already exists, skipping...", fname));
+            pb.println(format!("File {:?} already exists, skipping...", path));
             pb.set_message("Idle");
             return Ok(());
         }
@@ -97,14 +99,69 @@ async fn scrape_episode_file_url(url: &str) -> Result<String, ErrBox> {
     Ok(file_url.to_owned())
 }
 
+fn cli_setup<'a>() -> ArgMatches<'a> {
+    App::new(env!("CARGO_PKG_NAME"))
+        .arg(
+            Arg::with_name("latest")
+                .long("latest")
+                .short("l")
+                .help("Only get the latest episode")
+                .required(false)
+                .takes_value(false),
+        )
+        .arg(
+            Arg::with_name("jobs")
+                .long("jobs")
+                .short("j")
+                .help("How many episodes should be downloaded concurrently")
+                .takes_value(true)
+                .required(false)
+                .validator(|val| {
+                    let v = val
+                        .parse::<usize>()
+                        .map_err(|e| format!("Could not parse as number: {}", e.to_string()))?;
+                    if v == 0 {
+                        return Err("Job count cannot be 0".to_owned());
+                    }
+                    Ok(())
+                })
+                .default_value(DEFAULT_N_JOBS),
+        )
+        .arg(
+            Arg::with_name("outdir")
+                .long("dir")
+                .short("d")
+                .help("Put the files in <outdir>. Will be created if doesn't exist")
+                .takes_value(true)
+                .required(false)
+                .validator(|path| {
+                    let p = path
+                        .parse::<PathBuf>()
+                        .map_err(|e| format!("Could not parse as a path: {}", e.to_string()))?;
+                    if p.exists() && p.is_file() {
+                        return Err("Existing path must not be a file".to_owned());
+                    }
+                    Ok(())
+                })
+                .default_value("."),
+        )
+        .get_matches()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ErrBox> {
+    let matches = cli_setup();
     // Setup the MultiProgress bar
     let mpb = MultiProgress::new();
 
+    let n_jobs = matches.value_of("jobs").unwrap().parse()?;
+
+    let outdir = matches.value_of("outdir").unwrap().parse::<PathBuf>()?;
+    fs::create_dir_all(&outdir)?;
+
     // Setup the shared bars lock
     let bars = {
-        let v = (0..N_JOBS)
+        let v = (0..n_jobs)
             .map(|_n| {
                 let pb = ProgressBar::new(0);
                 pb.set_style(ProgressStyle::default_bar().template("{msg} {bar} {pos}/{len}"));
@@ -116,7 +173,7 @@ async fn main() -> Result<(), ErrBox> {
     };
 
     // Setup a semaphore for tracking available bars
-    let sema = Arc::new(Semaphore::new(N_JOBS));
+    let sema = Arc::new(Semaphore::new(n_jobs));
 
     // Obtain the main page
     let resp = reqwest::get(MFP_URL).await?;
@@ -134,7 +191,7 @@ async fn main() -> Result<(), ErrBox> {
         latest_resp,
         sema.clone(),
         bars.clone(),
-        latest_fname.to_owned().into(),
+        outdir.join(latest_fname),
     );
 
     // Scrape the rest of the espiode file URLs
@@ -144,6 +201,7 @@ async fn main() -> Result<(), ErrBox> {
     let dl_futs = fragment.select(&*MFP_EP_SELECTOR).map(|episode| {
         let bars4fut = bars.clone();
         let sema4fut = sema.clone();
+        let outdir4fut = outdir.clone();
         async move {
             let subpage = episode.value().attr("href").unwrap();
             let ep_url = &format!("{}/{}", MFP_URL, subpage);
@@ -153,7 +211,7 @@ async fn main() -> Result<(), ErrBox> {
 
             let file_resp = reqwest::get(&file_url).await?;
 
-            download_with_sema(file_resp, sema4fut, bars4fut, fname.to_owned().into()).await?;
+            download_with_sema(file_resp, sema4fut, bars4fut, outdir4fut.join(fname.to_owned())).await?;
 
             Result::<(), ErrBox>::Ok(())
         }
@@ -169,7 +227,13 @@ async fn main() -> Result<(), ErrBox> {
     };
 
     let cleanup_after_download_fut = async move {
-        future::try_join(latest_fut, downloads_joined).await?;
+        if matches.is_present("latest") {
+            latest_fut.await?;
+        } else {
+            future::try_join(latest_fut, downloads_joined).await?;
+        }
+
+        // Required to unblock the MultiProgress bar
         for mutex in bars.iter() {
             mutex.lock().await.finish();
         }
